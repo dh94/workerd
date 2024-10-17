@@ -408,6 +408,24 @@ public:
   }
 };
 
+class SetupEmscripten: public jsg::Object {
+public:
+  SetupEmscripten() {};
+  SetupEmscripten(jsg::Lock& js, const jsg::Url&) {}
+
+  jsg::JsValue getModule(jsg::Lock& js);
+
+  JSG_RESOURCE_TYPE(SetupEmscripten) {
+    JSG_METHOD(getModule);
+  }
+
+private:
+  // Reference to the api value of the emscripten module.
+  // Used for visitForGc when no js is currently running.
+  kj::Maybe<const jsg::JsRef<jsg::JsValue>&> emscriptenModule;
+  void visitForGc(jsg::GcVisitor& visitor);
+};
+
 using Worker = server::config::Worker;
 
 jsg::Ref<PyodideMetadataReader> makePyodideMetadataReader(
@@ -419,6 +437,6 @@ bool hasPythonModules(capnp::List<server::config::Worker::Module>::Reader module
   api::pyodide::ReadOnlyBuffer, api::pyodide::PyodideMetadataReader,                               \
       api::pyodide::ArtifactBundler, api::pyodide::DiskCache,                                      \
       api::pyodide::DisabledInternalJaeger, api::pyodide::SimplePythonLimiter,                     \
-      api::pyodide::MemorySnapshotResult
+      api::pyodide::MemorySnapshotResult, api::pyodide::SetupEmscripten
 
 }  // namespace workerd::api::pyodide

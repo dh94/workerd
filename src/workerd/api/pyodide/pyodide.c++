@@ -3,6 +3,8 @@
 //     https://opensource.org/licenses/Apache-2.0
 #include "pyodide.h"
 
+#include <workerd/api/pyodide/setup-emscripten.h>
+#include <workerd/io/worker.h>
 #include <workerd/util/string-buffer.h>
 #include <workerd/util/strings.h>
 
@@ -481,6 +483,24 @@ void DiskCache::put(jsg::Lock& js, kj::String key, kj::Array<kj::byte> data) {
     }
   } else {
     return;
+  }
+}
+
+jsg::JsValue SetupEmscripten::getModule(jsg::Lock& js) {
+  KJ_IF_SOME(module, emscriptenModule) {
+    return module.getHandle(js);
+  } else {
+    auto& runtime = KJ_ASSERT_NONNULL(workerd::Worker::Api::current().getEmscriptenRuntime());
+    js.v8Context()->SetSecurityToken(runtime.contextToken.getHandle(js));
+    emscriptenModule = runtime.emscriptenRuntime;
+    return KJ_ASSERT_NONNULL(emscriptenModule).getHandle(js);
+  }
+}
+
+void SetupEmscripten::visitForGc(jsg::GcVisitor& visitor) {
+  // const_cast is ok because the GcVisitor doesn't actually change the underlying value of the object.
+  KJ_IF_SOME(module, emscriptenModule) {
+    visitor.visit(const_cast<jsg::JsRef<jsg::JsValue>&>(module));
   }
 }
 

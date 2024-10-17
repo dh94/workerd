@@ -31,14 +31,14 @@ function pyimportMainModule(pyodide: Pyodide): PyModule {
   return pyodide.pyimport(mainModuleName);
 }
 
-let pyodidePromise: Promise<Pyodide> | undefined;
-function getPyodide(): Promise<Pyodide> {
+let pyodideInstance: Pyodide | undefined;
+function getPyodide(): Pyodide {
   return enterJaegerSpan('get_pyodide', () => {
-    if (pyodidePromise) {
-      return pyodidePromise;
+    if (pyodideInstance) {
+      return pyodideInstance;
     }
-    pyodidePromise = loadPyodide(IS_WORKERD, LOCKFILE, WORKERD_INDEX_URL);
-    return pyodidePromise;
+    pyodideInstance = loadPyodide(IS_WORKERD, LOCKFILE, WORKERD_INDEX_URL);
+    return pyodideInstance!;
   });
 }
 
@@ -118,7 +118,7 @@ function getMainModule(): Promise<PyModule> {
       return mainModulePromise;
     }
     mainModulePromise = (async function () {
-      const pyodide = await getPyodide();
+      const pyodide = getPyodide();
       await setupPackages(pyodide);
       Limiter.beginStartup();
       try {
@@ -134,7 +134,7 @@ function getMainModule(): Promise<PyModule> {
 }
 
 async function preparePython(): Promise<PyModule> {
-  const pyodide = await getPyodide();
+  const pyodide = getPyodide();
   const mainModule = await getMainModule();
   entropyBeforeRequest(pyodide._module);
   return mainModule;
@@ -177,7 +177,7 @@ try {
     if (IS_WORKERD) {
       // If we're in workerd, we have to do setupPackages in the IoContext, so don't start it yet.
       // TODO: fix this.
-      await getPyodide();
+      getPyodide();
     } else {
       // If we're not in workerd, setupPackages doesn't require IO so we can do it all here.
       await getMainModule();

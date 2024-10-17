@@ -22,6 +22,7 @@
 #include <workerd/api/modules.h>
 #include <workerd/api/node/node.h>
 #include <workerd/api/pyodide/pyodide.h>
+#include <workerd/api/pyodide/setup-emscripten.h>
 #include <workerd/api/queue.h>
 #include <workerd/api/r2-admin.h>
 #include <workerd/api/r2.h>
@@ -128,6 +129,92 @@ static const PythonConfig defaultConfig{
 };
 }  // namespace
 
+namespace {
+kj::Path getPyodideBundleFileName(kj::StringPtr version) {
+  return kj::Path(kj::str("pyodide_", version, ".capnp.bin"));
+}
+
+kj::Maybe<kj::Own<const kj::ReadableFile>> getPyodideBundleFile(
+    const kj::Maybe<kj::Own<const kj::Directory>>& maybeDir, kj::StringPtr version) {
+  KJ_IF_SOME(dir, maybeDir) {
+    kj::Path filename = getPyodideBundleFileName(version);
+    auto file = dir->tryOpenFile(filename);
+
+    return file;
+  }
+
+  return kj::none;
+}
+
+void writePyodideBundleFileToDisk(const kj::Maybe<kj::Own<const kj::Directory>>& maybeDir,
+    kj::StringPtr version,
+    kj::ArrayPtr<byte> bytes) {
+  KJ_IF_SOME(dir, maybeDir) {
+    kj::Path filename = getPyodideBundleFileName(version);
+    auto replacer = dir->replaceFile(filename, kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+
+    replacer->get().writeAll(bytes);
+    replacer->commit();
+  }
+}
+
+kj::Maybe<jsg::Bundle::Reader> fetchPyodideBundle(
+    const api::pyodide::PythonConfig& pyConfig, kj::StringPtr version) {
+  KJ_IF_SOME(version, pyConfig.pyodideBundleManager.getPyodideBundle(version)) {
+    return version;
+  }
+
+  auto maybePyodideBundleFile = getPyodideBundleFile(pyConfig.pyodideDiskCacheRoot, version);
+  KJ_IF_SOME(pyodideBundleFile, maybePyodideBundleFile) {
+    auto body = pyodideBundleFile->readAllBytes();
+    pyConfig.pyodideBundleManager.setPyodideBundleData(kj::str(version), kj::mv(body));
+    return pyConfig.pyodideBundleManager.getPyodideBundle(version);
+  }
+
+  if (version == "dev") {
+    // the "dev" version is special and indicates we're using the tip-of-tree version built for testing
+    // so we shouldn't fetch it from the internet, only check for its existence in the disk cache
+    return kj::none;
+  }
+
+  {
+    KJ_LOG(INFO, "Loading Pyodide package from internet...");
+    kj::Thread([&]() {
+      kj::AsyncIoContext io = kj::setupAsyncIo();
+      kj::HttpHeaderTable table;
+
+      kj::TlsContext::Options options;
+      options.useSystemTrustStore = true;
+
+      kj::Own<kj::TlsContext> tls = kj::heap<kj::TlsContext>(kj::mv(options));
+      auto& network = io.provider->getNetwork();
+      auto tlsNetwork = tls->wrapNetwork(network);
+      auto& timer = io.provider->getTimer();
+
+      auto client = kj::newHttpClient(timer, table, network, *tlsNetwork);
+
+      kj::HttpHeaders headers(table);
+
+      kj::String url =
+          kj::str("https://pyodide.runtime-playground.workers.dev/pyodide-capnp-bin/pyodide_",
+              version, ".capnp.bin");
+
+      auto req = client->request(kj::HttpMethod::GET, url.asPtr(), headers);
+
+      auto res = req.response.wait(io.waitScope);
+      auto body = res.body->readAllBytes().wait(io.waitScope);
+
+      writePyodideBundleFileToDisk(pyConfig.pyodideDiskCacheRoot, version, body);
+
+      pyConfig.pyodideBundleManager.setPyodideBundleData(kj::str(version), kj::mv(body));
+    });
+  }
+
+  KJ_LOG(INFO, "Loaded Pyodide package from internet");
+  return pyConfig.pyodideBundleManager.getPyodideBundle(version);
+}
+}  // namespace
+
 struct WorkerdApi::Impl final {
   kj::Own<CompatibilityFlags::Reader> features;
   kj::Maybe<kj::Own<jsg::modules::ModuleRegistry>> maybeOwnedModuleRegistry;
@@ -135,6 +222,7 @@ struct WorkerdApi::Impl final {
   JsgWorkerdIsolate jsgIsolate;
   api::MemoryCacheProvider& memoryCacheProvider;
   const PythonConfig& pythonConfig;
+  kj::Maybe<api::pyodide::EmscriptenRuntime> maybeEmscriptenRuntime;
 
   class Configuration {
   public:
@@ -168,7 +256,22 @@ struct WorkerdApi::Impl final {
         observer(kj::atomicAddRef(*observerParam)),
         jsgIsolate(v8System, Configuration(*this), kj::mv(observerParam), kj::mv(createParams)),
         memoryCacheProvider(memoryCacheProvider),
-        pythonConfig(pythonConfig) {}
+        pythonConfig(pythonConfig) {
+    jsgIsolate.runInLockScope([&](JsgWorkerdIsolate::Lock& lock) {
+      if (features->getPythonWorkers()) {
+        auto pythonRelease = KJ_ASSERT_NONNULL(getPythonSnapshotRelease(*features));
+        auto version = getPythonBundleName(pythonRelease);
+        auto bundle = KJ_ASSERT_NONNULL(
+            fetchPyodideBundle(pythonConfig, version), "Failed to get Pyodide bundle");
+        auto context = lock.newContext<api::ServiceWorkerGlobalScope>({}, lock.v8Isolate);
+        v8::Context::Scope scope(context.getHandle(lock));
+        // Init emscripten synchronously, the python script will import setup-emscripten and
+        // call setEmscriptenModele
+        maybeEmscriptenRuntime =
+            api::pyodide::EmscriptenRuntime::initialize(lock, true, *features, bundle);
+      }
+    });
+  }
 
   static v8::Local<v8::String> compileTextGlobal(
       JsgWorkerdIsolate::Lock& lock, capnp::Text::Reader reader) {
@@ -275,6 +378,10 @@ void WorkerdApi::setIsolateObserver(IsolateObserver&) {};
 void WorkerdApi::invalidateIsolateObserver() {};
 void WorkerdApi::setEnforcer(IsolateLimitEnforcer&) {}
 void WorkerdApi::invalidateEnforcer() {}
+
+const kj::Maybe<api::pyodide::EmscriptenRuntime>& WorkerdApi::getEmscriptenRuntime() const {
+  return impl->maybeEmscriptenRuntime;
+}
 
 Worker::Script::Source WorkerdApi::extractSource(kj::StringPtr name,
     config::Worker::Reader conf,
@@ -421,92 +528,6 @@ kj::Maybe<jsg::ModuleRegistry::ModuleInfo> WorkerdApi::tryCompileModule(jsg::Loc
   KJ_UNREACHABLE;
 }
 
-namespace {
-kj::Path getPyodideBundleFileName(kj::StringPtr version) {
-  return kj::Path(kj::str("pyodide_", version, ".capnp.bin"));
-}
-
-kj::Maybe<kj::Own<const kj::ReadableFile>> getPyodideBundleFile(
-    const kj::Maybe<kj::Own<const kj::Directory>>& maybeDir, kj::StringPtr version) {
-  KJ_IF_SOME(dir, maybeDir) {
-    kj::Path filename = getPyodideBundleFileName(version);
-    auto file = dir->tryOpenFile(filename);
-
-    return file;
-  }
-
-  return kj::none;
-}
-
-void writePyodideBundleFileToDisk(const kj::Maybe<kj::Own<const kj::Directory>>& maybeDir,
-    kj::StringPtr version,
-    kj::ArrayPtr<byte> bytes) {
-  KJ_IF_SOME(dir, maybeDir) {
-    kj::Path filename = getPyodideBundleFileName(version);
-    auto replacer = dir->replaceFile(filename, kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
-
-    replacer->get().writeAll(bytes);
-    replacer->commit();
-  }
-}
-
-kj::Maybe<jsg::Bundle::Reader> fetchPyodideBundle(
-    const api::pyodide::PythonConfig& pyConfig, kj::StringPtr version) {
-  KJ_IF_SOME(version, pyConfig.pyodideBundleManager.getPyodideBundle(version)) {
-    return version;
-  }
-
-  auto maybePyodideBundleFile = getPyodideBundleFile(pyConfig.pyodideDiskCacheRoot, version);
-  KJ_IF_SOME(pyodideBundleFile, maybePyodideBundleFile) {
-    auto body = pyodideBundleFile->readAllBytes();
-    pyConfig.pyodideBundleManager.setPyodideBundleData(kj::str(version), kj::mv(body));
-    return pyConfig.pyodideBundleManager.getPyodideBundle(version);
-  }
-
-  if (version == "dev") {
-    // the "dev" version is special and indicates we're using the tip-of-tree version built for testing
-    // so we shouldn't fetch it from the internet, only check for its existence in the disk cache
-    return kj::none;
-  }
-
-  {
-    KJ_LOG(INFO, "Loading Pyodide package from internet...");
-    kj::Thread([&]() {
-      kj::AsyncIoContext io = kj::setupAsyncIo();
-      kj::HttpHeaderTable table;
-
-      kj::TlsContext::Options options;
-      options.useSystemTrustStore = true;
-
-      kj::Own<kj::TlsContext> tls = kj::heap<kj::TlsContext>(kj::mv(options));
-      auto& network = io.provider->getNetwork();
-      auto tlsNetwork = tls->wrapNetwork(network);
-      auto& timer = io.provider->getTimer();
-
-      auto client = kj::newHttpClient(timer, table, network, *tlsNetwork);
-
-      kj::HttpHeaders headers(table);
-
-      kj::String url =
-          kj::str("https://pyodide.runtime-playground.workers.dev/pyodide-capnp-bin/pyodide_",
-              version, ".capnp.bin");
-
-      auto req = client->request(kj::HttpMethod::GET, url.asPtr(), headers);
-
-      auto res = req.response.wait(io.waitScope);
-      auto body = res.body->readAllBytes().wait(io.waitScope);
-
-      writePyodideBundleFileToDisk(pyConfig.pyodideDiskCacheRoot, version, body);
-
-      pyConfig.pyodideBundleManager.setPyodideBundleData(kj::str(version), kj::mv(body));
-    });
-  }
-
-  KJ_LOG(INFO, "Loaded Pyodide package from internet");
-  return pyConfig.pyodideBundleManager.getPyodideBundle(version);
-}
-}  // namespace
-
 void WorkerdApi::compileModules(jsg::Lock& lockParam,
     config::Worker::Reader conf,
     Worker::ValidationErrorReporter& errorReporter,
@@ -521,6 +542,11 @@ void WorkerdApi::compileModules(jsg::Lock& lockParam,
     if (hasPythonModules(confModules)) {
       KJ_REQUIRE(featureFlags.getPythonWorkers(),
           "The python_workers compatibility flag is required to use Python.");
+
+      // Inject SetupEmscripten module
+      modules->addBuiltinModule<SetupEmscripten>(
+          "internal:setup-emscripten", workerd::jsg::ModuleRegistry::Type::INTERNAL);
+
       // Inject Pyodide bundle
       auto pythonRelease = KJ_ASSERT_NONNULL(getPythonSnapshotRelease(featureFlags));
       auto version = getPythonBundleName(pythonRelease);
