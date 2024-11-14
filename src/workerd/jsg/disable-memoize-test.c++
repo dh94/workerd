@@ -137,7 +137,7 @@ void expectEval(
 }
 
 KJ_TEST("Create a context with memoization disabled change flags then create another context") {
-  auto observer = kj::atomicRefcounted<workerd::IsolateObserver>();
+  auto observer = kj::atomicRefcounted<JsgIsolateObserver>();
   capnp::MallocMessageBuilder flagsArena;
   auto flags = flagsArena.initRoot<::workerd::CompatibilityFlags>();
   auto flagsReader = flags.asReader();

@@ -35,7 +35,7 @@ public:
   WorkerdApi(jsg::V8System& v8System,
       CompatibilityFlags::Reader features,
       v8::Isolate::CreateParams createParams,
-      kj::Own<IsolateObserver> observer,
+      kj::Own<JsgIsolateObserver> observer,
       api::MemoryCacheProvider& memoryCacheProvider,
       const PythonConfig& pythonConfig,
       kj::Maybe<kj::Own<jsg::modules::ModuleRegistry>> newModuleRegistry);
@@ -55,8 +55,9 @@ public:
       jsg::Lock& lock) const override;
   jsg::JsObject wrapExecutionContext(
       jsg::Lock& lock, jsg::Ref<api::ExecutionContext> ref) const override;
-  IsolateObserver& getMetrics() override;
-  const IsolateObserver& getMetrics() const override;
+  const jsg::IsolateObserver& getObserver() const override;
+  void setIsolateObserver(IsolateObserver&) override;
+  void invalidateIsolateObserver() override;
   void setEnforcer(IsolateLimitEnforcer&) override;
   void invalidateEnforcer() override;
 
